@@ -1,21 +1,7 @@
-name: Terragrunt Infrastructure Management
+name: Terragrunt Infrastructure Management Library
 
 on:
-  push:
-    branches: [ main, develop ]
-    paths:
-      - 'repos/**'
-      - 'env.hcl'
-      - 'root.hcl'
-      - '.github/workflows/terragrunt.yml'
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'repos/**'
-      - 'env.hcl'
-      - 'root.hcl'
-      - '.github/workflows/terragrunt.yml'
-  workflow_dispatch:
+  workflow_call:
     inputs:
       environment:
         description: 'Environment to deploy (dev, prod, all)'
@@ -35,6 +21,9 @@ on:
         - plan
         - apply
         - destroy
+    secrets:
+      personal_access_token:
+        required: true
 
 permissions:
   contents: read
