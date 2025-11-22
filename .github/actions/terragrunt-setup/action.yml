@@ -1,0 +1,141 @@
+name: 'Terragrunt Setup and Execution'
+description: 'Sets up Terraform, Terragrunt, and executes terragrunt commands'
+author: 'testing-org-egarciam'
+
+inputs:
+  terragrunt_version:
+    description: 'Terragrunt version to install'
+    required: false
+    default: '0.67.16'
+  terraform_version:
+    description: 'Terraform version to install'
+    required: false
+    default: '1.6.6'
+  working_directory:
+    description: 'Working directory for terragrunt commands'
+    required: false
+    default: '.'
+  command:
+    description: 'Terragrunt command to execute'
+    required: true
+  github_token:
+    description: 'GitHub token for authentication'
+    required: true
+  plan_file:
+    description: 'Path to save/load plan file'
+    required: false
+    default: '/tmp/tfplan'
+  auto_approve:
+    description: 'Auto approve for apply/destroy commands'
+    required: false
+    default: 'false'
+
+outputs:
+  plan_output:
+    description: 'Output from terragrunt plan'
+    value: ${{ steps.terragrunt.outputs.plan_output }}
+  command_output:
+    description: 'Output from terragrunt command'
+    value: ${{ steps.terragrunt.outputs.command_output }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Setup Terragrunt
+      shell: bash
+      run: |
+        wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ inputs.terragrunt_version }}/terragrunt_linux_amd64
+        chmod +x terragrunt
+        sudo mv terragrunt /usr/local/bin/
+
+    - name: Clean Terragrunt Cache
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        rm -rf .terragrunt-cache
+        rm -rf .terraform
+        rm -f .terraform.lock.hcl
+
+    - name: Terragrunt Init
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: terragrunt init -upgrade
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        TF_IN_AUTOMATION: true
+
+    - name: Execute Terragrunt Command
+      id: terragrunt
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      run: |
+        case "${{ inputs.command }}" in
+          "plan")
+            echo "Executing terragrunt plan..."
+            terragrunt plan -out=${{ inputs.plan_file }} -no-color | tee plan_output.txt
+            echo "plan_output<<EOF" >> $GITHUB_OUTPUT
+            cat plan_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "command_output<<EOF" >> $GITHUB_OUTPUT
+            cat plan_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          "apply")
+            echo "Executing terragrunt apply..."
+            if [[ "${{ inputs.auto_approve }}" == "true" ]]; then
+              if [[ -f "${{ inputs.plan_file }}" ]]; then
+                terragrunt apply ${{ inputs.plan_file }} | tee apply_output.txt
+              else
+                terragrunt apply -auto-approve | tee apply_output.txt
+              fi
+            else
+              if [[ -f "${{ inputs.plan_file }}" ]]; then
+                terragrunt apply ${{ inputs.plan_file }} | tee apply_output.txt
+              else
+                echo "No plan file found and auto-approve is false"
+                exit 1
+              fi
+            fi
+            echo "command_output<<EOF" >> $GITHUB_OUTPUT
+            cat apply_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          "destroy")
+            echo "Executing terragrunt destroy..."
+            if [[ "${{ inputs.auto_approve }}" == "true" ]]; then
+              terragrunt destroy -auto-approve | tee destroy_output.txt
+            else
+              terragrunt destroy | tee destroy_output.txt
+            fi
+            echo "command_output<<EOF" >> $GITHUB_OUTPUT
+            cat destroy_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          "validate")
+            echo "Executing terragrunt validate..."
+            terragrunt validate | tee validate_output.txt
+            echo "command_output<<EOF" >> $GITHUB_OUTPUT
+            cat validate_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "Executing custom command: ${{ inputs.command }}"
+            terragrunt ${{ inputs.command }} | tee command_output.txt
+            echo "command_output<<EOF" >> $GITHUB_OUTPUT
+            cat command_output.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+        esac
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        TF_IN_AUTOMATION: true
+
+branding:
+  icon: 'settings'
+  color: 'blue'
