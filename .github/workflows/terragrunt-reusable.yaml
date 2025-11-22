@@ -1,0 +1,439 @@
+name: Reusable Terragrunt Infrastructure Management
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment to deploy (dev, prod, all)'
+        required: false
+        default: 'all'
+        type: string
+      action:
+        description: 'Terragrunt action to perform'
+        required: false
+        default: 'plan'
+        type: string
+      terragrunt_version:
+        description: 'Terragrunt version to use'
+        required: false
+        default: '0.67.16'
+        type: string
+      terraform_version:
+        description: 'Terraform version to use'
+        required: false
+        default: '1.6.6'
+        type: string
+      working_directory_dev:
+        description: 'Working directory for dev environment'
+        required: false
+        default: 'repos/dev'
+        type: string
+      working_directory_prod:
+        description: 'Working directory for prod environment'
+        required: false
+        default: 'repos/prod'
+        type: string
+      dev_path_filters:
+        description: 'Path filters for dev environment changes'
+        required: false
+        # default: 'repos/dev/**,env.hcl,root.hcl'
+          
+        # # default: |
+        # #   - 'repos/dev/**'
+        # #   - 'env.hcl'
+        # #   - 'root.hcl'
+        type: string
+      prod_path_filters:
+        description: 'Path filters for prod environment changes'
+        required: false
+        # default: 'repos/dev/**,env.hcl,root.hcl'
+        # # default: |
+        # #   - 'repos/prod/**'
+        # #   - 'env.hcl'
+        # #   - 'root.hcl'
+        type: string
+    secrets:
+      GH_SUPERTOKEN:
+        description: 'GitHub token for authentication'
+        required: true
+      
+    outputs:
+      dev-plan-status:
+        description: "Status of dev plan job"
+        value: ${{ jobs.plan-dev.result }}
+      prod-plan-status:
+        description: "Status of prod plan job"
+        value: ${{ jobs.plan-prod.result }}
+      dev-apply-status:
+        description: "Status of dev apply job"
+        value: ${{ jobs.apply-dev.result }}
+      prod-apply-status:
+        description: "Status of prod apply job"
+        value: ${{ jobs.apply-prod.result }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: write
+
+env:
+  TERRAGRUNT_VERSION: ${{ inputs.terragrunt_version }}
+  TERRAFORM_VERSION: ${{ inputs.terraform_version }}
+  TF_IN_AUTOMATION: true
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      dev-changed: ${{ steps.changes.outputs.dev }}
+      prod-changed: ${{ steps.changes.outputs.prod }}
+      run-dev: ${{ steps.determine.outputs.run-dev }}
+      run-prod: ${{ steps.determine.outputs.run-prod }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            dev:
+              ${{ inputs.dev_path_filters }}
+            prod:
+              ${{ inputs.prod_path_filters }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Determine what to run
+        id: determine
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.environment }}" == "all" ]]; then
+              echo "run-dev=true" >> $GITHUB_OUTPUT
+              echo "run-prod=true" >> $GITHUB_OUTPUT
+            elif [[ "${{ inputs.environment }}" == "dev" ]]; then
+              echo "run-dev=true" >> $GITHUB_OUTPUT
+              echo "run-prod=false" >> $GITHUB_OUTPUT
+            elif [[ "${{ inputs.environment }}" == "prod" ]]; then
+              echo "run-dev=false" >> $GITHUB_OUTPUT
+              echo "run-prod=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "run-dev=${{ steps.changes.outputs.dev }}" >> $GITHUB_OUTPUT
+            echo "run-prod=${{ steps.changes.outputs.prod }}" >> $GITHUB_OUTPUT
+          fi
+
+  plan-dev:
+    name: Plan Development
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-dev == 'true'
+    environment: development
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory_dev }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Clean Terragrunt Cache
+        run: |
+          rm -rf .terragrunt-cache
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+
+      - name: Terragrunt Init
+        run: terragrunt init -upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Terragrunt Plan
+        id: plan
+        run: |
+          terragrunt plan -out=/tmp/dev-tfplan -no-color
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-tfplan
+          path: /tmp/dev-tfplan
+          retention-days: 5
+
+      - name: Comment PR (Plan)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            
+            try {
+              const plan = execSync('cd ${{ inputs.working_directory_dev }} && terragrunt show -no-color /tmp/dev-tfplan', { encoding: 'utf8' });
+              const comment = `## 🏗️ Terragrunt Plan - Development Environment
+              
+              <details>
+              <summary>Show Plan</summary>
+              
+              \`\`\`terraform
+              ${plan}
+              \`\`\`
+              </details>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Error reading plan:', error);
+            }
+
+  apply-dev:
+    name: Apply Development
+    runs-on: ubuntu-latest
+    needs: [detect-changes, plan-dev]
+    if: |
+      needs.detect-changes.outputs.run-dev == 'true' && 
+      (github.ref == 'refs/heads/main' || 
+       (github.event_name == 'workflow_dispatch' && inputs.action == 'apply'))
+    environment: development
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory_dev }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Clean Terragrunt Cache
+        run: |
+          rm -rf .terragrunt-cache
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+
+      - name: Terragrunt Init
+        run: terragrunt init -upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dev-tfplan
+          path: /tmp
+
+      - name: Terragrunt Apply
+        run: terragrunt apply /tmp/dev-tfplan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+  plan-prod:
+    name: Plan Production
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.run-prod == 'true'
+    environment: production
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory_prod }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Clean Terragrunt Cache
+        run: |
+          rm -rf .terragrunt-cache
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+
+      - name: Terragrunt Init
+        run: terragrunt init -upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Terragrunt Plan
+        id: plan
+        run: |
+          terragrunt plan -out=/tmp/prod-tfplan -no-color
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-tfplan
+          path: /tmp/prod-tfplan
+          retention-days: 5
+
+      - name: Comment PR (Plan)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            
+            try {
+              const plan = execSync('cd ${{ inputs.working_directory_prod }} && terragrunt show -no-color /tmp/prod-tfplan', { encoding: 'utf8' });
+              const comment = `## 🏗️ Terragrunt Plan - Production Environment
+              
+              <details>
+              <summary>Show Plan</summary>
+              
+              \`\`\`terraform
+              ${plan}
+              \`\`\`
+              </details>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Error reading plan:', error);
+            }
+
+  apply-prod:
+    name: Apply Production
+    runs-on: ubuntu-latest
+    needs: [detect-changes, plan-prod, apply-dev]
+    if: |
+      needs.detect-changes.outputs.run-prod == 'true' && 
+      (github.ref == 'refs/heads/main' || 
+       (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')) &&
+      (needs.apply-dev.result == 'success' || needs.apply-dev.result == 'skipped')
+    environment: production
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory_prod }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+
+      - name: Clean Terragrunt Cache
+        run: |
+          rm -rf .terragrunt-cache
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+
+      - name: Terragrunt Init
+        run: terragrunt init -upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prod-tfplan
+          path: /tmp
+
+      - name: Terragrunt Apply
+        run: terragrunt apply /tmp/prod-tfplan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+    environment: ${{ matrix.env }}
+    strategy:
+      matrix:
+        env: ${{ fromJSON(
+          inputs.environment == 'all' && '["dev", "prod"]' ||
+          inputs.environment == 'dev' && '["dev"]' ||
+          inputs.environment == 'prod' && '["prod"]' ||
+          '[]'
+          ) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.env == 'dev' && inputs.working_directory_dev || inputs.working_directory_prod }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          wget -O terragrunt https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TERRAGRUNT_VERSION }}/terragrunt_linux_amd64
+          chmod +x terragrunt
+          sudo mv terragrunt /usr/local/bin/
+      
+      - name: Clean Terragrunt Cache
+        run: |
+          rm -rf .terragrunt-cache
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+      
+      - name: Terragrunt Init
+        run: terragrunt init -upgrade
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
+
+      - name: Destroy Infrastructure
+        run: terragrunt destroy -auto-approve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_SUPERTOKEN }}
